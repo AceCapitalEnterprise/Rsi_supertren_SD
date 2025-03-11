@@ -32,7 +32,7 @@ RISK_FREE_RATE = 0.07  # Still needed for potential future use
 
 # New constants for STD-based StopLoss
 LOOKBACK_PERIOD = 10  # Number of price points for STD calculation
-STD_MULTIPLIER = 2    # Multiplier for StopLoss width
+STD_MULTIPLIER = 1.2    # Multiplier for StopLoss width
 
 # Global state (unchanged)
 order = 0
