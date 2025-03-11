@@ -1,0 +1,293 @@
+import numpy as np
+import pandas as pd
+import pandas_ta as ta
+from datetime import date, datetime, timedelta, time as t
+import csv
+import time
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import concurrent.futures
+from breeze_connect import BreezeConnect
+import urllib
+
+# Initialize BreezeConnect (unchanged)
+breeze = BreezeConnect(api_key="d96783Qp368558*55FI36Z24W0ET39Lf")
+breeze.generate_session(api_secret="58836g597W4l8977h7~%eX9967^807x3",
+                        session_token="50837515")
+
+# Configure logging (unchanged)
+logging.basicConfig(
+    filename='trading_bot.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Constants (unchanged except removed Greek weights)
+TIME_1 = t(9, 15)
+TIME_2 = t(15, 20)
+EXPIRY = '2025-03-06'
+MAX_RETRIES = 10
+RATE_LIMIT_DELAY = 3
+RISK_FREE_RATE = 0.07  # Still needed for potential future use
+
+# New constants for STD-based StopLoss
+LOOKBACK_PERIOD = 10  # Number of price points for STD calculation
+STD_MULTIPLIER = 2    # Multiplier for StopLoss width
+
+# Global state (unchanged)
+order = 0
+order2 = 0
+sl = 0
+sl2 = 0
+buy_price = 0
+buy_pe_price = 0
+
+# Removed black_scholes_greeks since it's no longer needed for SL
+
+class TradingBot:
+    def __init__(self, breeze):
+        self.breeze = breeze
+        self.today = datetime.now().strftime('%Y-%m-%d')
+        self.yesterday = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
+        self.expiry_date = datetime.strptime(EXPIRY, '%Y-%m-%d')
+        # Add price history for STD calculation
+        self.ce_price_history = []
+        self.pe_price_history = []
+
+    # nifty_spot method unchanged
+    @retry(stop=stop_after_attempt(MAX_RETRIES), 
+           wait=wait_exponential(multiplier=1, min=4, max=10),
+           retry=retry_if_exception_type(Exception))
+    def nifty_spot(self):
+        try:
+            nifty = self.breeze.get_quotes(stock_code="NIFTY",
+                                           exchange_code="NSE",
+                                           expiry_date=f"{self.today}T06:00:00.000Z",
+                                           product_type="cash",
+                                           right="others",
+                                           strike_price="0")
+            time.sleep(RATE_LIMIT_DELAY)
+            if nifty.get('Success'):
+                return float(pd.DataFrame(nifty['Success'])['ltp'][0])
+            raise ValueError("No success response from API")
+        except Exception as e:
+            logging.error(f"Error fetching Nifty spot: {str(e)}")
+            raise
+
+    # option_historical method unchanged
+    @retry(stop=stop_after_attempt(MAX_RETRIES),
+           wait=wait_exponential(multiplier=1, min=4, max=10),
+           retry=retry_if_exception_type(Exception))
+    def option_historical(self, ce_or_pe, strike):
+        try:
+            option_data = self.breeze.get_historical_data_v2(interval="1minute",
+                                                              from_date=f"{self.yesterday}T07:00:00.000Z",
+                                                              to_date=f"{self.today}T17:00:00.000Z",
+                                                              stock_code="NIFTY",
+                                                              exchange_code="NFO",
+                                                              product_type="options",
+                                                              expiry_date=f"{EXPIRY}T07:00:00.000Z",
+                                                              right=ce_or_pe,
+                                                              strike_price=strike)
+            time.sleep(RATE_LIMIT_DELAY)
+            if option_data.get('Success'):
+                return pd.DataFrame(option_data['Success'])
+            raise ValueError("No success response from API")
+        except Exception as e:
+            logging.error(f"Error fetching historical data {ce_or_pe} {strike}: {str(e)}")
+            raise
+
+    # calculate_indicators unchanged
+    def calculate_indicators(self, df):
+        df.ta.rsi(close='close', length=14, append=True)
+        supertrend = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=2)
+        df['supertrend'] = supertrend['SUPERTd_10_2.0']
+        df['volume_avg'] = df['volume'].rolling(window=5).mean()
+        df['volume_check'] = (df['volume'] > 1.5 * df['volume_avg']).astype(int)
+        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        return df
+
+    # place_order unchanged
+    def place_order(self, action, right, strike, price=""):
+        for _ in range(MAX_RETRIES):
+            try:
+                leg = self.breeze.get_option_chain_quotes(stock_code="NIFTY",
+                                                         exchange_code="NFO",
+                                                         product_type="options",
+                                                         expiry_date=f'{EXPIRY}T06:00:00.000Z',
+                                                         right=right,
+                                                         strike_price=strike)
+                time.sleep(RATE_LIMIT_DELAY)
+                leg_df = leg['Success']
+                leg_df = pd.DataFrame(leg_df)
+                ltp_value = float(leg_df['ltp'][0])
+                return ltp_value
+            except Exception as e:
+                logging.warning(f"Order placement attempt failed: {str(e)}")
+                time.sleep(RATE_LIMIT_DELAY)
+        raise Exception("Failed to place order after retries")
+
+    # get_current_price unchanged
+    def get_current_price(self, right, strike):
+        try:
+            quotes = self.breeze.get_option_chain_quotes(
+                stock_code="NIFTY",
+                exchange_code="NFO",
+                product_type="options",
+                expiry_date=f'{EXPIRY}T06:00:00.000Z',
+                right=right,
+                strike_price=strike)
+            time.sleep(RATE_LIMIT_DELAY)
+            if quotes.get('Success'):
+                return float(pd.DataFrame(quotes['Success'])['ltp'][0])
+            return None
+        except Exception as e:
+            logging.error(f"Error getting current price: {str(e)}")
+            return None
+
+    # exit_position unchanged
+    def exit_position(self, right, strike, buy_price, reason):
+        sell_price = self.place_order("sell", right, strike)
+        pnl = round(sell_price - buy_price, 2)
+        logging.info(f"{right} exit, reason: {reason}, PnL: {pnl}")
+        
+        csv_file = "rsi_supertrend_RPS_new.csv"
+        entry_time = datetime.now().strftime('%H:%M:%S')  # Note: Should store at entry
+        try:
+            with open(csv_file, 'x', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow(['Date', 'Entry Time', 'Strike', 'CE or PE', 'Entry premium', 
+                               'Exit Time', 'Exit premium', 'PnL'])
+        except FileExistsError:
+            with open(csv_file, 'a', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow([self.today, entry_time, strike, f'{right}_{EXPIRY}', 
+                               buy_price, datetime.now().strftime('%H:%M:%S'), 
+                               sell_price, pnl])
+        return sell_price
+
+    # New STD-based StopLoss method
+    def calculate_std_stoploss(self, current_price, price_history):
+        """Calculate dynamic StopLoss based on standard deviation."""
+        price_history.append(current_price)
+        
+        # Maintain lookback period
+        if len(price_history) > LOOKBACK_PERIOD:
+            price_history.pop(0)
+            
+        # If insufficient data, return None (or use a default)
+        if len(price_history) < LOOKBACK_PERIOD:
+            return None
+            
+        # Calculate standard deviation
+        prices_array = np.array(price_history)
+        std_dev = np.std(prices_array)
+        
+        # Set StopLoss below current price
+        stop_loss = current_price - (std_dev * STD_MULTIPLIER)
+        return stop_loss
+
+    def handle_call_options(self):
+        global order, sl, buy_price
+        try:
+            nifty = self.nifty_spot()
+            ce_otm = round(nifty / 50) * 50 + 100
+            ce_option = self.calculate_indicators(self.option_historical("call", ce_otm))
+            last_row = ce_option.iloc[-1]
+
+            if order == 0 and last_row['RSI_14'] > 70 and last_row['supertrend'] == 1 and last_row['volume_check'] == 1:
+                buy_price = self.place_order("buy", "call", ce_otm)
+                sl = self.calculate_std_stoploss(buy_price, self.ce_price_history)
+                if sl is None:  # Default SL if insufficient history
+                    sl = buy_price * 0.9  # 10% below entry as fallback
+                logging.info(f"Call entry at {buy_price}, Initial SL: {sl:.2f}")
+                order = 1
+                return order, sl
+            
+            if order == 1:
+                current_price = self.get_current_price("call", ce_otm)
+                if current_price:
+                    sl_new = self.calculate_std_stoploss(current_price, self.ce_price_history)
+                    if sl_new is None:  # Use previous SL if insufficient data
+                        sl_new = sl
+                    sl = max(sl, sl_new)  # Trail up only
+                    logging.info(f"Call current: {current_price}, Trailing SL: {sl:.2f}")
+                    
+                    if current_price <= sl:
+                        self.exit_position("call", ce_otm, buy_price, "STD SL Hit")
+                        order = 0
+                        self.ce_price_history.clear()  # Reset history on exit
+                    elif last_row['RSI_14'] < 70 or last_row['supertrend'] != 1 or t(datetime.now().hour, datetime.now().minute) == t(15,19):
+                        self.exit_position("call", ce_otm, buy_price, "Condition Exit")
+                        order = 0
+                        self.ce_price_history.clear()  # Reset history on exit
+            return order, sl
+
+        except Exception as e:
+            logging.error(f"Call options error: {str(e)}")
+            return order, sl
+
+    def handle_put_options(self):
+        global order2, sl2, buy_pe_price
+        try:
+            nifty = self.nifty_spot()
+            pe_otm = round(nifty / 50) * 50 - 100
+            pe_option = self.calculate_indicators(self.option_historical("put", pe_otm))
+            last_row = pe_option.iloc[-1]
+
+            if order2 == 0 and last_row['RSI_14'] > 70 and last_row['supertrend'] == 1 and last_row['volume_check'] == 1:
+                buy_pe_price = self.place_order("buy", "put", pe_otm)
+                sl2 = self.calculate_std_stoploss(buy_pe_price, self.pe_price_history)
+                if sl2 is None:  # Default SL if insufficient history
+                    sl2 = buy_pe_price * 0.9  # 10% below entry as fallback
+                logging.info(f"Put entry at {buy_pe_price}, Initial SL: {sl2:.2f}")
+                order2 = 1
+                return order2, sl2
+            
+            if order2 == 1:
+                current_price = self.get_current_price("put", pe_otm)
+                if current_price:
+                    sl_new = self.calculate_std_stoploss(current_price, self.pe_price_history)
+                    if sl_new is None:  # Use previous SL if insufficient data
+                        sl_new = sl2
+                    sl2 = max(sl2, sl_new)  # Trail up only
+                    logging.info(f"Put current: {current_price}, Trailing SL: {sl2:.2f}")
+                    
+                    if current_price <= sl2:
+                        self.exit_position("put", pe_otm, buy_pe_price, "STD SL Hit")
+                        order2 = 0
+                        self.pe_price_history.clear()  # Reset history on exit
+                    elif last_row['RSI_14'] < 70 or last_row['supertrend'] != 1 or t(datetime.now().hour, datetime.now().minute) == t(15,19):
+                        self.exit_position("put", pe_otm, buy_pe_price, "Condition Exit")
+                        order2 = 0
+                        self.pe_price_history.clear()  # Reset history on exit
+            return order2, sl2
+
+        except Exception as e:
+            logging.error(f"Put options error: {str(e)}")
+            return order2, sl2
+
+def main():
+    bot = TradingBot(breeze)
+    
+    while True:
+        try:
+            now = datetime.now()
+            current_time = t(now.hour, now.minute)
+            
+            if TIME_1 < current_time < TIME_2 and now.second == 0:
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future_ce = executor.submit(bot.handle_call_options)
+                    future_pe = executor.submit(bot.handle_put_options)
+                    global order, sl, order2, sl2
+                    order, sl = future_ce.result()
+                    order2, sl2 = future_pe.result()
+                
+                time.sleep(1)
+                
+        except Exception as e:
+            logging.error(f"Main loop error: {str(e)}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()# Rsi_supertren_SD

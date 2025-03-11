@@ -1,1 +1,0 @@
-# Rsi_supertren_SD
